@@ -145,17 +145,17 @@ cargo run --release -p materialcraft                          # desktop app
 cargo run --release -p materialcraft -- package.sbs           # open an SBS package
 cargo run --release -p materialcraft -- --control 7878        # + JSON control channel
 cargo run --release -p materialcraft-cli -- mcp               # MCP server (stdio)
-cargo run --release -p materialcraft-cli -- new wood wood.sbs
-cargo run --release -p materialcraft-cli -- render wood.sbs wood.png --scene sphere --full --hq
-cargo run --release -p materialcraft-cli -- export wood.sbs textures --format png --depth 16
+cargo run --release -p materialcraft-cli -- new pbr material.sbs
+cargo run --release -p materialcraft-cli -- render material.sbs material.png --scene sphere --full --hq
+cargo run --release -p materialcraft-cli -- export material.sbs textures --format png --depth 16
 cargo run --release -p materialcraft-cli -- export my.sbs out --set wear=0.7    # with a graph input "wear" set first
 cargo run --release -p materialcraft-cli -- run my.sbs file.exportMaterial '{"path": "my.mcmat", "size": 2048}'   # for TextureCraft
 cd apps/materialcraft-web && trunk serve                      # web build
 cargo xtask ci                                                # fmt, clippy, tests, layering, wasm
 ```
 
-You need Rust 1.95 or newer. The app opens with an empty graph in a new package; **File ▸ New ▸ Graph...**
-starts from a PBR template or one of the sample materials.
+You need Rust 1.95 or newer. The app opens with an empty graph in a new package. Choose
+**File ▸ New ▸ Atomic sample**, or open `examples/atomic_sample.sbs`, to try the primitive workflow.
 
 ### Use it from Claude Code and other agents
 
