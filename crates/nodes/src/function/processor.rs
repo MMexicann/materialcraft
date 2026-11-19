@@ -1,14 +1,29 @@
 use super::{EvaluationContext, EvaluationState, compile};
 use crate::{CookContext, CookResult};
+use craft_texture::{Image, Kind, Limits};
 use materialcraft_core::Value;
-use materialcraft_image::{Image, Kind};
 use rayon::prelude::*;
-use std::sync::Arc;
 
-fn pixel(value: Value, gray: bool) -> Result<[f32; 4], String> {
+fn pixel(value: Value, gray: bool, format: materialcraft_core::OutputFormat) -> Result<[f32; 4], String> {
     let values = super::value_type::floats(&value)?;
+    let integer = matches!(format, materialcraft_core::OutputFormat::U8 | materialcraft_core::OutputFormat::U16 | materialcraft_core::OutputFormat::Inherit);
+
+    // Integer texture storage converts NaN to black and saturates infinities
+    // Rejecting those values before storage breaks zero-softness masks
+    if !integer && values.iter().take(super::value_type::dimensions(&value)).any(|value| !value.is_finite()) {
+        return Err("pixel function produced a non-finite output".into());
+    }
+
     Ok(if gray {
-        [values[0], 0.0, 0.0, 0.0]
+        let intensity = if super::value_type::dimensions(&value) == 4 {
+            // RGBA results on a grayscale processor use equal RGB weights
+            // Preserve the fused accumulation order at floating-point outputs
+            values[2].mul_add(1.0 / 3.0, values[0].mul_add(1.0 / 3.0, values[1] * (1.0 / 3.0)))
+        } else {
+            values[0]
+        };
+
+        [intensity, 0.0, 0.0, 0.0]
     } else {
         match super::value_type::dimensions(&value) {
             1 => [values[0], values[0], values[0], 1.0],
@@ -25,7 +40,7 @@ pub(crate) fn pixel_processor(context: &CookContext) -> CookResult {
     let gray = !context.b("color_mode");
     let kind = if gray { Kind::Gray } else { Kind::Color };
 
-    let (width, height) = materialcraft_image::clamp_size(context.w, context.h);
+    let (width, height) = craft_texture::clamp_size(context.w, context.h);
     let channels = kind.channels();
     let mut data = vec![0.0; width as usize * height as usize * channels];
     data.par_chunks_mut(width as usize * channels).enumerate().try_for_each_init(EvaluationState::default, |state, (y, row)| -> Result<(), String> {
@@ -39,10 +54,11 @@ pub(crate) fn pixel_processor(context: &CookContext) -> CookResult {
                 variables: context.vars,
             };
 
-            let result = pixel(program.evaluate_pixel(&evaluation, state)?, gray)?;
+            let result = pixel(program.evaluate_pixel(&evaluation, state)?, gray, context.format)?;
             target.copy_from_slice(result.get(..channels).ok_or("invalid output channels")?);
         }
+
         Ok(())
     })?;
-    Ok(vec![Image { w: width, h: height, kind, data: Arc::new(data) }])
+    Ok(vec![Image::from_data(width, height, kind, data, &Limits::default()).map_err(|e| e.to_string())?])
 }

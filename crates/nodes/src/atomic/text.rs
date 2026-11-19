@@ -118,9 +118,9 @@ pub(super) fn definition() -> NodeDefinition {
         .any_in("background", "Background")
         .boolean("color_mode", "Color output", false)
         .color("background", "Background color", [0.0, 0.0, 0.0, 1.0])
-        .text("text", "Text", "MaterialCraft")
+        .text("text", "Text", "")
         .text("fontdata", "Font reference", "")
-        .float("fontsize", "Font size", 0.09, 0.0, 1.0)
+        .float("fontsize", "Font size", 0.25, 0.0, 1.0)
         .float2("position", "Position", [0.0; 2], -1.0, 1.0)
         .float4("matrix", "Transform matrix", [1.0, 0.0, 0.0, 1.0], -10.0, 10.0)
         .choice("alignment", "Alignment", &["Left", "Center", "Right"], 1)
@@ -136,6 +136,7 @@ fn layout(context: &CookContext, text: &str) -> Vec<CapsuleSegment> {
     let matrix = context.v4("matrix");
     let anchor = [(0.5 + position[0]) * context.w as f32, (0.5 + position[1]) * context.h as f32];
     let lines: Vec<&str> = text.split('\n').collect();
+
     // The block is centered vertically on the anchor (cap height of the first line to baseline of the last)
     let top = -((lines.len().max(1) - 1) as f32 * line_height + 6.0) * 0.5;
     let mut segments = Vec::new();
@@ -166,6 +167,7 @@ fn layout(context: &CookContext, text: &str) -> Vec<CapsuleSegment> {
             }
         }
     }
+
     segments
 }
 
@@ -203,13 +205,26 @@ mod tests {
     #[test]
     fn renders_material_craft() {
         let def = find("text").unwrap();
-        let p = resolve_params(def, &BTreeMap::new());
+        let p = resolve_params(def, &BTreeMap::from([("text".into(), materialcraft_core::Value::Text("MaterialCraft".into()))]));
         let no_res = |_: &str| None;
         let vars = BTreeMap::new();
-        let context = CookContext { w: 256, h: 256, seed: 0, tile: true, inputs: &[], params: &p, resource: &no_res, vars: &vars };
+        let context = CookContext {
+            format: materialcraft_core::OutputFormat::F32,
+            w: 256,
+            h: 256,
+            seed: 0,
+            tile: true,
+            inputs: &[],
+            params: &p,
+            resource: &no_res,
+            vars: &vars,
+        };
+
         let img = &text(&context).unwrap()[0];
-        let lit = img.data.iter().filter(|value| **value > 0.5).count();
+        let lit = img.data().iter().filter(|value| **value > 0.5).count();
+
         assert!(lit > 300, "{lit} pixels");
+
         // Centered: nothing in the top and bottom quarters
         assert!((0..256).all(|x| img.get(x, 20, false)[0] == 0.0 && img.get(x, 236, false)[0] == 0.0));
     }

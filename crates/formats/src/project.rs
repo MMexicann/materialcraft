@@ -19,7 +19,7 @@ const MAX_ENTRIES: usize = 100_000;
 const MAX_ENTRY_BYTES: u64 = 256 << 20;
 /// Most bytes all members may expand to together. Without a total, many individually allowed
 /// members could expand far past what one open should spend (audit: MaterialCraft #1).
-const MAX_TOTAL_BYTES: u64 = 1 << 30;
+const MAX_TOTAL_EXPANDED_BYTES: u64 = 1 << 30;
 
 fn bad(message: impl Into<String>) -> FormatError {
     FormatError::BadPackage(message.into())
@@ -86,9 +86,10 @@ pub fn read(bytes: &[u8], identity: &str) -> Result<sbs::SbsRead> {
     if zip.len() > MAX_ENTRIES {
         return Err(bad(format!("archive has more than {MAX_ENTRIES} entries")));
     }
+
     let mut files = BTreeMap::new();
     let mut seen = BTreeSet::new();
-    let mut total = 0u64;
+    let mut total_expanded_bytes = 0u64;
     for index in 0..zip.len() {
         let entry = zip.by_index(index).map_err(|error| bad(error.to_string()))?;
         let name = entry.name().to_string();
@@ -111,12 +112,15 @@ pub fn read(bytes: &[u8], identity: &str) -> Result<sbs::SbsRead> {
         if content.len() as u64 > MAX_ENTRY_BYTES {
             return Err(bad(format!("archive entry `{name}` is too large")));
         }
-        total = total.saturating_add(content.len() as u64);
-        if total > MAX_TOTAL_BYTES {
+
+        total_expanded_bytes = total_expanded_bytes.saturating_add(content.len() as u64);
+        if total_expanded_bytes > MAX_TOTAL_EXPANDED_BYTES {
             return Err(bad("archive expands past its total size limit"));
         }
+
         files.insert(name, content);
     }
+
     let roots: Vec<_> = files.keys().filter(|name| !name.contains('/') && name.to_ascii_lowercase().ends_with(".sbs")).cloned().collect();
     if roots.len() != 1 {
         return Err(bad("A MaterialCraft archive must contain exactly one SBS file at its root"));
@@ -133,7 +137,13 @@ pub fn read(bytes: &[u8], identity: &str) -> Result<sbs::SbsRead> {
         }
 
         let content = files.get(&file).ok_or_else(|| bad(format!("Missing archived package `{file}`")))?;
-        let reader = |reference: &str| resolve(&file, reference).ok().and_then(|path| files.get(&path).cloned());
+        let reader = |reference: &str| {
+            if reference.starts_with("sbs://") {
+                sbs::library::read(reference).ok()
+            } else {
+                resolve(&file, reference).ok().and_then(|path| files.get(&path).cloned())
+            }
+        };
         let mut read = sbs::read_sbs(content, &file, &reader)?;
 
         warnings.append(&mut read.warnings);
@@ -151,9 +161,11 @@ pub fn read(bytes: &[u8], identity: &str) -> Result<sbs::SbsRead> {
             names.insert(reference, format!("{prefix}{target}"));
             pending.push(target);
         }
+
         remap(&mut read.pkg, &names);
         packages.insert(file, read.pkg);
     }
+
     let mut root_package = packages.get(&root).cloned().ok_or_else(|| bad("Missing SBS package"))?;
     root_package.dependencies = packages.into_iter().map(|(path, package)| (format!("{prefix}{path}"), std::sync::Arc::new(package))).collect();
     Ok(sbs::SbsRead { pkg: root_package, warnings })

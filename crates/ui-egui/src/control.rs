@@ -56,11 +56,12 @@ pub fn poll(app: &mut MaterialCraftApp, ctx: &egui::Context) {
     let reqs: Vec<ControlRequest> = rx.try_iter().collect();
     for r in reqs {
         if r.method == "ui.screenshot" {
-            // Captured from the UI pass (`request_screenshots`), where viewport commands land.
+            // Captured from the UI pass (`request_screenshots`), where viewport commands land
             app.pending_screenshots.push(r.reply);
             ctx.request_repaint();
             continue;
         }
+
         let reply = handle(app, ctx, &r.method, &r.params);
         let _ = r.reply.send(reply);
         ctx.request_repaint();
@@ -72,6 +73,7 @@ pub fn request_screenshots(app: &mut MaterialCraftApp, ctx: &egui::Context) {
     if app.pending_screenshots.is_empty() {
         return;
     }
+
     let replies = std::mem::take(&mut app.pending_screenshots);
     let repaint = ctx.clone();
     let callback = egui::ScreenshotCallback::new(move |img| {
@@ -81,6 +83,7 @@ pub fn request_screenshots(app: &mut MaterialCraftApp, ctx: &egui::Context) {
         for r in &replies {
             let _ = r.send(answer.clone());
         }
+
         repaint.request_repaint();
     });
     ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(callback));
@@ -140,6 +143,7 @@ fn modifiers(v: &Value) -> Modifiers {
 /// Frames of input for a list of event descriptions. Each press, release and move lands on its
 /// own frame, so egui sees real clicks and drags.
 pub fn parse_events(list: &[Value]) -> Result<Vec<Scripted>, String> {
+    const MAX_INPUT_FRAMES: usize = 10_000;
     let mut frames = Vec::new();
     let frame = |events: Vec<Event>, _modifiers: Modifiers| Scripted { events };
     for (i, e) in list.iter().enumerate() {
@@ -204,10 +208,12 @@ pub fn parse_events(list: &[Value]) -> Result<Vec<Scripted>, String> {
             }
             other => return Err(format!("event {i}: unknown type `{other}`")),
         }
-        if frames.len() > 10_000 {
+
+        if frames.len() > MAX_INPUT_FRAMES {
             return Err("too many input events".into());
         }
     }
+
     Ok(frames)
 }
 
@@ -255,16 +261,15 @@ fn handle_inner(app: &mut MaterialCraftApp, ctx: &egui::Context, method: &str, p
         "command.run" => {
             let Some(id) = p.get("id").and_then(Value::as_str) else { return err("`id` is required") };
             let params = p.get("params").cloned().unwrap_or(Value::Null);
+            if matches!(id, "view.3d.saveRender" | "view.3d.exportGeometry" | "view.2d.copyImage") {
+                return displayed_command(app, ctx, id, &params);
+            }
+
             match crate::cook::guard("command request", || {
                 Ok(materialcraft_engine::commands::execute_request(&mut app.session, id, &params).map_err(|error| error.to_string()))
             }) {
                 Ok(Ok(v)) => {
-                    if id == "view.previewSize" {
-                        app.ui.prefs.preview_size = app.session.preview_size.unwrap_or(0);
-                    }
-                    if id == "session.history" {
-                        app.ui.prefs.history = app.session.history_prefs;
-                    }
+                    app.sync_preferences_after_command(id);
                     app.close_subgraph_after(id);
                     ok(v)
                 }
@@ -336,6 +341,7 @@ fn handle_inner(app: &mut MaterialCraftApp, ctx: &egui::Context, method: &str, p
             if !crate::menus::implemented(id) {
                 return err(format!("menu item `{id}` is not implemented"));
             }
+
             let modality = crate::shell::modality::Modality::capture(app, ctx);
             if let crate::shell::modality::Modality::Blocked(blocker) = modality
                 && !modality.allows(id)
@@ -351,6 +357,7 @@ fn handle_inner(app: &mut MaterialCraftApp, ctx: &egui::Context, method: &str, p
             if p.is_object() {
                 merge_json(&mut cur, p);
             }
+
             match serde_json::from_value::<crate::state::UiState>(cur) {
                 Ok(mut ui) => {
                     ui.graph_camera = ui.graph_camera.sanitized();
@@ -376,12 +383,56 @@ fn handle_inner(app: &mut MaterialCraftApp, ctx: &egui::Context, method: &str, p
         }
         "view.screenshot" => {
             let shown = if p.get("view").and_then(Value::as_str) == Some("2d") { &app.view2d.shown } else { &app.view3d.shown };
-            match shown.as_ref().and_then(|(w, h, px)| encode_png(*w, *h, px.clone())) {
+            match shown.as_ref().and_then(|(w, h, px)| encode_png(*w, *h, px.as_ref().clone())) {
                 Some((w, h, png)) => ok(json!({ "width": w, "height": h, "png": base64::engine::general_purpose::STANDARD.encode(png) })),
                 None => err("that view has not drawn anything yet"),
             }
         }
         other => err(format!("unknown method `{other}`")),
+    }
+}
+
+/// Give a programmatic command the same currently displayed bytes the toolbar or dialog uses
+fn displayed_command(app: &mut MaterialCraftApp, ctx: &egui::Context, id: &str, params: &Value) -> Value {
+    use materialcraft_engine::DisplaySnapshot;
+
+    let snapshot = match id {
+        "view.3d.saveRender" => app.view3d.shown.as_ref().map(|(width, height, pixels)| DisplaySnapshot::render(*width, *height, pixels.clone())),
+        "view.3d.exportGeometry" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                crate::view3d::displayed_mesh(app).map(DisplaySnapshot::geometry)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                return err("exporting geometry by path needs the desktop app");
+            }
+        }
+        "view.2d.copyImage" => {
+            app.view2d.shown.as_ref().map(|(width, height, pixels)| DisplaySnapshot::image(*width, *height, pixels.clone(), app.view2d.shown_premultiplied))
+        }
+        _ => return err(format!("unknown display command `{id}`")),
+    };
+    let Some(snapshot) = snapshot else { return err("that view has not drawn anything yet") };
+
+    app.session.begin_display_handoff(snapshot);
+    let result = crate::cook::guard("command request", || {
+        Ok(materialcraft_engine::commands::execute_request(&mut app.session, id, params).map_err(|error| error.to_string()))
+    });
+    let output = app.session.finish_display_handoff();
+    match result {
+        Ok(Ok(value)) if id == "view.2d.copyImage" => {
+            let Some((width, height, pixels, premultiplied)) = output.and_then(DisplaySnapshot::into_image) else {
+                return err("the copy command returned no displayed image");
+            };
+            let size = [width as usize, height as usize];
+            let image =
+                if premultiplied { egui::ColorImage::from_rgba_premultiplied(size, &pixels) } else { egui::ColorImage::from_rgba_unmultiplied(size, &pixels) };
+            ctx.copy_image(image);
+            ok(value)
+        }
+        Ok(Ok(value)) => ok(value),
+        Ok(Err(error)) | Err(error) => err(error),
     }
 }
 
@@ -399,7 +450,8 @@ mod tests {
             json!({"type": "scroll", "pos": [5, 5], "delta": [0, -60]}),
         ];
         let f = parse_events(&list).unwrap();
-        // click: move, press, release; drag: move, press, 4 moves, release; key: 2; text 1; scroll 1.
+
+        // click: move, press, release; drag: move, press, 4 moves, release; key: 2; text 1; scroll 1
         assert_eq!(f.len(), 3 + 7 + 2 + 1 + 1);
         assert!(parse_events(&[json!({"type": "key", "key": "NoSuchKey"})]).is_err());
         assert!(parse_events(&[json!({"type": "click"})]).is_err());
@@ -469,6 +521,39 @@ mod tests {
         assert!(!app.ui.prefs.thumbnails);
         assert_eq!(app.ui.prefs.ui_scale, 1.5);
         assert_eq!(app.ui.prefs.autosave_minutes, 9);
+    }
+
+    #[test]
+    fn cache_commands_and_saved_preferences_stay_in_sync() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let reply = handle(&mut app, &ctx, "command.run", &json!({"id": "library.cache.configure", "params": {"diskMib": 256, "maxPreviews": 8000}}));
+
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+
+        app.apply_prefs();
+
+        assert_eq!(app.ui.prefs.library_cache, app.session.library_cache_prefs);
+        assert_eq!(app.ui.prefs.library_cache.disk_mib, 256);
+
+        let saved: crate::UiState = serde_json::from_value(serde_json::to_value(&app.ui).unwrap()).unwrap();
+        let mut restored = MaterialCraftApp::headless(materialcraft_engine::sample_session(), saved);
+
+        assert_eq!(restored.session.library_cache_prefs, app.session.library_cache_prefs);
+
+        let reply = handle(&mut restored, &ctx, "ui.set", &json!({"prefs": {"libraryCache": {"diskMib": 32}}}));
+
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+
+        restored.apply_prefs();
+
+        assert_eq!(restored.session.library_cache_prefs.disk_mib, 32);
+        assert_eq!(restored.session.library_cache_prefs.max_previews, 8000);
+
+        let reply = handle(&mut restored, &ctx, "command.run", &json!({"id": "library.cache.clear"}));
+
+        assert_eq!(reply["ok"], json!(true), "{reply}");
+        assert_eq!(restored.session.library_cache_clear_epoch, 1);
     }
 
     #[test]

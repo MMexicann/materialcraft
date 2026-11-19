@@ -16,6 +16,7 @@ impl Warnings {
             line.1 += 1;
             return;
         }
+
         if self.lines.len() >= MAX_WARNINGS {
             self.dropped += 1;
             return;
@@ -26,13 +27,14 @@ impl Warnings {
     }
 
     pub(super) fn finish(self) -> Vec<String> {
-        let total = self.lines.len() + self.dropped;
-        let mut out: Vec<String> =
+        let total_messages = self.lines.len() + self.dropped;
+        let mut messages: Vec<String> =
             self.lines.into_iter().take(MAX_WARNINGS).map(|(line, count)| if count > 1 { format!("{line} (×{count})") } else { line }).collect();
-        if total > MAX_WARNINGS {
-            out.push(format!("…and {} more warnings", total - MAX_WARNINGS));
+        if total_messages > MAX_WARNINGS {
+            messages.push(format!("…and {} more warnings", total_messages - MAX_WARNINGS));
         }
-        out
+
+        messages
     }
 }
 
@@ -42,13 +44,17 @@ mod tests {
 
     #[test]
     fn warning_messages_are_capped_as_they_arrive() {
-        let mut w = Warnings::default();
+        let mut warnings = Warnings::default();
+
         for i in 0..MAX_WARNINGS + 5 {
-            w.add(format!("warning {i}"));
+            warnings.add(format!("warning {i}"));
         }
-        assert_eq!(w.lines.len(), MAX_WARNINGS);
-        let out = w.finish();
-        assert_eq!(out.len(), MAX_WARNINGS + 1);
-        assert_eq!(out.last().unwrap(), "…and 5 more warnings");
+
+        assert_eq!(warnings.lines.len(), MAX_WARNINGS);
+
+        let messages = warnings.finish();
+
+        assert_eq!(messages.len(), MAX_WARNINGS + 1);
+        assert_eq!(messages.last().unwrap(), "…and 5 more warnings");
     }
 }

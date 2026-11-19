@@ -9,6 +9,29 @@ fn no_linked_files(_: &str) -> Option<Vec<u8>> {
 }
 
 #[test]
+fn shuffle_roundtrip_preserves_signed_channel_selectors() {
+    for selector in [-2_i32, -1, 8, 9, 16, 255] {
+        let xml = format!(
+            r#"<package><content><graph><identifier v="Original"/><compNodes>
+          <compNode><uid v="1"/><compImplementation><compFilter><filter v="shuffle"/><parameters>
+            <parameter><name v="channelred"/><paramValue><constantValueInt32 v="{selector}"/></paramValue></parameter>
+          </parameters></compFilter></compImplementation></compNode>
+        </compNodes></graph></content></package>"#
+        );
+
+        let loaded = read_sbs(xml.as_bytes(), "original.sbs", &no_linked_files).unwrap();
+        let node = &loaded.pkg.graphs[0].nodes[0];
+
+        assert_eq!(node.params.get("red"), Some(&Value::Enum(selector as u32)), "selector {selector}");
+
+        let saved = write_sbs(&loaded.pkg).unwrap();
+        let reloaded = read_sbs(&saved, "original.sbs", &no_linked_files).unwrap();
+
+        assert_eq!(reloaded.pkg.graphs[0].nodes[0].params.get("red"), node.params.get("red"), "saved selector {selector}");
+    }
+}
+
+#[test]
 fn saved_dot_outputs_load_as_incomplete_functions() {
     let xml = r#"<package><identifier v="Dots"/><content><function><identifier v="Incomplete"/>
       <paramValue><dynamicValue><rootnode v="2"/><paramNodes>
@@ -59,7 +82,7 @@ fn sample_package() -> Package {
     });
     pkg.graphs.push(graph);
 
-    let orange = materialcraft_image::Image::filled(4, 4, materialcraft_image::Kind::Color, [1.0, 0.5, 0.0, 1.0]);
+    let orange = craft_texture::Image::filled(4, 4, craft_texture::Kind::Color, [1.0, 0.5, 0.0, 1.0]);
     let png = crate::encode(&orange, "png", crate::Depth::U8, true).unwrap();
     pkg.resources.push(Resource::new("tex", "tex.png", ResourceBytes::new(png)));
     pkg
@@ -77,16 +100,37 @@ fn sniffs_sbs() {
 }
 
 #[test]
-fn saving_refreshes_the_writer_version_without_changing_the_schema_version() {
-    let old = br#"<package><identifier v="Older file"/><formatVersion v="1.1.0.202401"/><updaterVersion v="0.0.1"/><content/></package>"#;
-    let reopened = read_sbs(old, "older.sbs", &no_linked_files).unwrap();
-    for package in [Package::new("New file"), reopened.pkg] {
+fn first_sbs_save_assigns_the_workspace_version_to_both_fields() {
+    let unversioned = read_sbs(b"<package><content/></package>", "unversioned.sbs", &no_linked_files).unwrap().pkg;
+    for package in [Package::new("New file"), unversioned] {
+        assert!(package.format_version.is_none());
+
         let text = String::from_utf8(write_sbs(&package).unwrap()).unwrap();
         let document = roxmltree::Document::parse(&text).unwrap();
-        let root = document.root_element();
-        assert_eq!(super::xml::child_value(root, "updaterVersion"), Some(env!("CARGO_PKG_VERSION")));
-        assert_eq!(super::xml::child_value(root, "formatVersion"), Some(super::constant::FORMAT_VERSION));
-        assert!(!text.contains("0.0.1"));
+        for field in ["formatVersion", "updaterVersion"] {
+            assert_eq!(super::xml::child_value(document.root_element(), field), Some(env!("CARGO_PKG_VERSION")));
+        }
+    }
+}
+
+#[test]
+fn later_sbs_saves_keep_the_original_format_version_and_refresh_the_updater() {
+    for baseline in ["0.0.7", "1.1.0.202401"] {
+        let old = format!(r#"<package><identifier v="Older file"/><formatVersion v="{baseline}"/><updaterVersion v="0.0.1"/><content/></package>"#);
+        let mut package = read_sbs(old.as_bytes(), "older.sbs", &no_linked_files).unwrap().pkg;
+        for _ in 0..3 {
+            assert_eq!(package.format_version.as_deref(), Some(baseline));
+
+            // Snapshot/restore and subsequent saves must retain the baseline too
+            package = serde_json::from_slice(&serde_json::to_vec(&package).unwrap()).unwrap();
+            let bytes = write_sbs(&package).unwrap();
+            let document = roxmltree::Document::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+
+            assert_eq!(super::xml::child_value(document.root_element(), "formatVersion"), Some(baseline));
+            assert_eq!(super::xml::child_value(document.root_element(), "updaterVersion"), Some(env!("CARGO_PKG_VERSION")));
+
+            package = read_sbs(&bytes, "saved.sbs", &no_linked_files).unwrap().pkg;
+        }
     }
 }
 
@@ -413,4 +457,84 @@ fn input_usage_defaults_and_unknown_metadata_stay_unclassified() {
             assert_eq!(node.params.get("usage"), Some(&Value::Enum(ComponentUsage::ANY_INDEX)));
         }
     }
+}
+
+#[test]
+fn published_material_preserves_disabled_nodes_and_localized_typed_interfaces() {
+    use crate::material::{read_material, write_material};
+    use materialcraft_core::{GraphInstance, GraphPort, ValueType};
+
+    let mut helper = Graph::new("Helper");
+    let input = helper.add_node("input_grayscale", [0.0; 2]);
+    helper.node_mut(input).unwrap().params.insert("identifier".into(), Value::Text("gray".into()));
+    let out = helper.add_node("output", [0.0; 2]);
+    helper.node_mut(out).unwrap().params.insert("identifier".into(), Value::Text("result".into()));
+    helper.connect(input, "output", out, "input").unwrap();
+    let mut dependency = Package::new("Dependency");
+    dependency.graphs.push(helper);
+
+    let mut graph = Graph::new("Root");
+    let uniform = graph.add_node("uniform", [0.0; 2]);
+    let levels = graph.add_node("levels", [0.0; 2]);
+    graph.node_mut(levels).unwrap().disabled = true;
+    graph.connect(uniform, "output", levels, "input").unwrap();
+    let instance = graph.add_node("graph_instance", [0.0; 2]);
+    let inputs = vec![GraphPort { identifier: "gray".into(), type_code: 2 }, GraphPort { identifier: "unused<&".into(), type_code: ValueType::Float as u32 }];
+    graph.node_mut(instance).unwrap().instance = Some(GraphInstance {
+        package: "dependency.sbs".into(),
+        graph: "Helper".into(),
+        inputs: inputs.clone(),
+        outputs: vec![GraphPort { identifier: "result".into(), type_code: 2 }],
+        defaults: Default::default(),
+        label: String::new(),
+    });
+    graph.connect(levels, "output", instance, "gray").unwrap();
+    let out = graph.add_node("output", [0.0; 2]);
+    graph.connect(instance, "result", out, "input").unwrap();
+    let mut package = Package::new("Package");
+    package.graphs.push(graph);
+    package.dependencies.insert("dependency.sbs".into(), std::sync::Arc::new(dependency));
+
+    let bytes = write_material(&package, 0).unwrap();
+    let (opened, entry) = read_material(&bytes).unwrap();
+    let graph = &opened.graphs[entry];
+    assert!(graph.nodes.iter().find(|node| node.def == "levels").unwrap().disabled);
+    assert!(!graph.nodes.iter().find(|node| node.def == "uniform").unwrap().disabled);
+    let node = graph.nodes.iter().find(|node| node.def == "graph_instance").unwrap();
+    let restored = node.instance.as_ref().expect("localization must retain the typed interface");
+    assert!(restored.package.is_empty());
+    assert_eq!(restored.inputs, inputs);
+    assert_eq!(restored.outputs, vec![GraphPort { identifier: "result".into(), type_code: 2 }]);
+    assert!(opened.graph_by_name(&restored.graph).is_some());
+    assert!(graph.connections.iter().any(|wire| wire.to == node.id && wire.to_port == "gray"));
+
+    // Republish the already-localized graph to exercise local interfaces
+    let bytes = write_material(&opened, entry).unwrap();
+    let (reopened, entry) = read_material(&bytes).unwrap();
+    assert_eq!(reopened.graphs[entry].nodes.iter().find_map(|node| node.instance.as_ref()).unwrap().inputs, inputs);
+    assert!(reopened.graphs[entry].nodes.iter().find(|node| node.def == "levels").unwrap().disabled);
+}
+
+#[test]
+fn inferred_instance_inputs_respect_the_typed_interface_limit() {
+    use materialcraft_core::{GraphInstance, GraphPort};
+
+    let mut package = Package::new("Package");
+    let mut root = Graph::new("Root");
+    let source = root.add_node("uniform", [0.0; 2]);
+    let instance = root.add_node("graph_instance", [0.0; 2]);
+    let inputs = (0..4096).map(|index| GraphPort { identifier: format!("input{index}"), type_code: 1 }).collect();
+    root.node_mut(instance).unwrap().instance =
+        Some(GraphInstance { label: String::new(), package: String::new(), graph: "Helper".into(), inputs, outputs: Vec::new(), defaults: Default::default() });
+    root.connect(source, "output", instance, "input0").unwrap();
+    package.graphs.extend([root, Graph::new("Helper")]);
+    let xml = String::from_utf8(write_sbs(&package).unwrap()).unwrap();
+    let xml = xml.replace("<connection><identifier v=\"input0\"", "<connection><identifier v=\"inferred\"");
+
+    let restored = read_sbs(xml.as_bytes(), "instance.sbs", &no_linked_files).unwrap();
+
+    let root = &restored.pkg.graphs[0];
+    assert_eq!(root.instances().next().unwrap().inputs.len(), 4096);
+    assert!(root.connections.is_empty());
+    assert!(restored.warnings.iter().any(|warning| warning.contains("4096-input")));
 }

@@ -1,5 +1,5 @@
+use craft_texture::{Image, Kind};
 use materialcraft_core::{Curve, FunctionGraph, Gradient, Value};
-use materialcraft_image::{Image, Kind};
 use std::collections::BTreeMap;
 
 /// Where a cook runs: output size, seed, tiling, inputs and resolved parameters
@@ -7,6 +7,7 @@ pub struct CookContext<'a> {
     pub w: u32,
     pub h: u32,
     pub seed: u32,
+    pub format: materialcraft_core::OutputFormat,
     pub tile: bool,
     /// By input port order; `None` = not connected
     pub inputs: &'a [Option<Image>],
@@ -18,6 +19,10 @@ pub struct CookContext<'a> {
 }
 
 impl CookContext<'_> {
+    pub fn tiling_axes(&self) -> [bool; 2] {
+        self.vars.get("$tiling").and_then(Value::as_i32).map_or([self.tile; 2], |mask| [mask & 1 != 0, mask & 2 != 0])
+    }
+
     pub fn value(&self, id: &str) -> Option<&Value> {
         self.params.get(id)
     }
@@ -93,7 +98,7 @@ impl CookContext<'_> {
 
     /// The kind an "Any" output takes: the main input's, else `fallback`
     pub fn main_kind(&self, fallback: Kind) -> Kind {
-        self.inputs.iter().flatten().next().map_or(fallback, |i| i.kind)
+        self.inputs.iter().flatten().next().map_or(fallback, |i| i.kind())
     }
 
     /// A gray image from `f(u, v)` at the output size

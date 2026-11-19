@@ -3,7 +3,7 @@ use crate::{Result, sbs};
 use materialcraft_core::{Package, ResourceBytes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, Write};
 
 const MAX_RESOURCE_STEM_CHARS: usize = 40;
 const MAX_RESOURCE_EXTENSION_CHARS: usize = 16;
@@ -16,6 +16,15 @@ pub struct ProjectFiles {
 
 impl ProjectFiles {
     pub fn build(package: &Package, filename: &str, archive: bool) -> Result<Self> {
+        Self::build_with_links(package, filename, archive, false)
+    }
+
+    /// Save inside an authorized library tree without duplicating its shared linked resources.
+    pub fn build_linked(package: &Package, filename: &str) -> Result<Self> {
+        Self::build_with_links(package, filename, false, true)
+    }
+
+    fn build_with_links(package: &Package, filename: &str, archive: bool, preserve_links: bool) -> Result<Self> {
         let filename = crate::safe_file_name(filename);
         let stem = filename.rsplit_once('.').map_or(filename.as_str(), |(stem, _)| stem);
         let entry = if archive { SBS_ENTRY.to_string() } else { format!("{stem}.sbs") };
@@ -54,16 +63,16 @@ impl ProjectFiles {
         }
 
         let mut result = Self { entry: entry.clone(), files: BTreeMap::new() };
-        result.add_package(package, &entry, &names)?;
+        result.add_package(package, &entry, &names, preserve_links)?;
         for (source, file) in &names {
             let package = package.dependencies.get(source).ok_or_else(|| bad("Package dependency disappeared"))?;
-            result.add_package(package, file, &names)?;
+            result.add_package(package, file, &names, false)?;
         }
 
         Ok(result)
     }
 
-    fn add_package(&mut self, package: &Package, file: &str, names: &BTreeMap<String, String>) -> Result<()> {
+    fn add_package(&mut self, package: &Package, file: &str, names: &BTreeMap<String, String>, preserve_links: bool) -> Result<()> {
         let mut package = package.clone();
         let folder = file.rsplit_once('/').map_or("", |(folder, _)| folder);
         let local_names = names
@@ -82,6 +91,11 @@ impl ProjectFiles {
                 }
 
                 return Err(bad(format!("Resource `{}` has no data", resource.name)));
+            }
+
+            if preserve_links && !resource.source.is_empty() {
+                resource.bytes = ResourceBytes::default();
+                continue;
             }
 
             let name = crate::safe_file_name(&resource.file);
@@ -110,7 +124,26 @@ impl ProjectFiles {
     }
 
     pub fn zip(&self) -> Result<Vec<u8>> {
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        Ok(self.write_zip(Cursor::new(Vec::new()))?.into_inner())
+    }
+
+    /// Replace a native archive atomically and report its saved byte length.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn write_archive(&self, path: &std::path::Path) -> Result<usize> {
+        let mut length = 0;
+        craft_atomic::atomic_write_with(path, |file| {
+            self.write_zip(std::io::BufWriter::new(&mut *file)).map_err(std::io::Error::other)?.flush()?;
+            length = usize::try_from(file.metadata()?.len()).map_err(std::io::Error::other)?;
+            Ok(())
+        })
+        .map_err(|error| crate::FormatError::Io(format!("{}: {error}", path.display())))?;
+
+        Ok(length)
+    }
+
+    /// Write an archive to a seekable destination without buffering the whole archive
+    pub fn write_zip<W: Write + Seek>(&self, destination: W) -> Result<W> {
+        let mut writer = zip::ZipWriter::new(destination);
         writer.add_directory("resources/", zip::write::SimpleFileOptions::default()).map_err(|error| bad(error.to_string()))?;
         for (name, bytes) in &self.files {
             let is_text = name.ends_with(".sbs") || name.ends_with(".svg");
@@ -122,7 +155,7 @@ impl ProjectFiles {
             writer.write_all(bytes.as_slice()).map_err(|error| bad(error.to_string()))?;
         }
 
-        Ok(writer.finish().map_err(|error| bad(error.to_string()))?.into_inner())
+        writer.finish().map_err(|error| bad(error.to_string()))
     }
 
     pub fn xml(&self) -> Result<&[u8]> {

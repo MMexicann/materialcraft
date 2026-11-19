@@ -25,18 +25,22 @@ fn output_size_function_controls_resolution_and_survives_sbs() {
 
     let cooked = session.cook();
     let image = cooked.image(owner, 0).unwrap();
-    assert_eq!((image.w, image.h), (128, 32));
+
+    assert_eq!((image.width(), image.height()), (128, 32));
     assert!(cooked.nodes[&owner].error.is_none());
 
     let bytes = formats::sbs::write_sbs(&session.pkg).unwrap();
     let loaded = formats::sbs::read_sbs(&bytes, "parameter-functions.sbs", &|_| None).unwrap();
+
     assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
     let mut reopened = Session::new(loaded.pkg);
     reopened.preview_size = None;
     let owner = reopened.graph().unwrap().nodes.iter().find(|node| node.def == "uniform").unwrap().id;
     let cooked = reopened.cook();
     let image = cooked.image(owner, 0).unwrap();
-    assert_eq!((image.w, image.h), (128, 32));
+
+    assert_eq!((image.width(), image.height()), (128, 32));
 }
 
 #[test]
@@ -90,7 +94,8 @@ fn native_dynamic_output_size_is_not_discarded_on_load() {
     let cooked = session.cook();
 
     let image = cooked.image(owner, 0).unwrap();
-    assert_eq!((image.w, image.h), (64, 32));
+
+    assert_eq!((image.width(), image.height()), (64, 32));
 }
 
 #[test]
@@ -120,7 +125,7 @@ fn inherited_size_functions_use_nominal_input_size_before_preview_capping() {
     assert_eq!(cooked.nodes[&owner].error, None);
     assert_eq!(cooked.nodes[&owner].base.size, [256, 64]);
     assert_eq!(cooked.nodes[&owner].base_values[&BaseParameter::OutputSize], Value::Int2([1, 0]));
-    assert_eq!((cooked.image(owner, 0).unwrap().w, cooked.image(owner, 0).unwrap().h), (16, 4));
+    assert_eq!((cooked.image(owner, 0).unwrap().width(), cooked.image(owner, 0).unwrap().height()), (16, 4));
 
     command(
         &mut session,
@@ -224,9 +229,10 @@ fn empty_and_wrong_type_functions_remain_editable_but_report_cook_errors() {
 
 #[test]
 fn instance_parameter_functions_work_without_stored_literals_and_use_instance_size() {
-    use materialcraft_engine::core::{Graph, Package, ValueType};
+    use materialcraft_engine::core::{Graph, OutputFormat, Package, ValueType};
 
     let mut source = Graph::new("Source");
+    source.format = OutputFormat::F32;
     let color = source.add_node("uniform", [0.0; 2]);
     source.node_mut(color).unwrap().params.insert("color_mode".into(), Value::Bool(false));
     source.node_mut(color).unwrap().functions.insert("color".into(), FunctionGraph::input("amount", ValueType::Float4));
@@ -252,6 +258,7 @@ fn instance_parameter_functions_work_without_stored_literals_and_use_instance_si
     source.connect(dimensions, "output", size_output, "input").unwrap();
     let mut parent = Graph::new("Parent");
     parent.size = [6, 5];
+    parent.format = OutputFormat::F32;
     let owner = parent.add_node("graph_instance", [0.0; 2]);
     parent.node_mut(owner).unwrap().params.insert("graph".into(), Value::Text("Source".into()));
     let mut package = Package::new("Instances");
@@ -265,13 +272,14 @@ fn instance_parameter_functions_work_without_stored_literals_and_use_instance_si
     assert_eq!(result.nodes[&owner].error, None);
     assert!(result.nodes[&owner].outputs.iter().any(|output| output.as_value() == Some(&Value::Float2([64.0, 32.0]))));
     assert!((result.image(owner, 0).unwrap().get_gray(0, 0, false) - 0.75).abs() < 1e-6);
-    assert_eq!((result.image(owner, 0).unwrap().w, result.image(owner, 0).unwrap().h), (64, 32));
+    assert_eq!((result.image(owner, 0).unwrap().width(), result.image(owner, 0).unwrap().height()), (64, 32));
     assert!(!session.graph().unwrap().node(owner).unwrap().params.contains_key("amount"));
 
     let bytes = formats::sbs::write_sbs(&session.pkg).unwrap();
     let loaded = formats::sbs::read_sbs(&bytes, "instance.sbs", &|_| None).unwrap();
     let mut reopened = Session::new(loaded.pkg);
     let owner = reopened.graph().unwrap().nodes[0].id;
+
     assert!((reopened.cook().image(owner, 0).unwrap().get_gray(0, 0, false) - 0.75).abs() < 1e-6);
 }
 
@@ -289,16 +297,72 @@ fn color_boolean_enum_and_text_parameters_use_typed_function_outputs() {
         command(&mut session, "graph.node.function", json!({"id": owner, "param": parameter, "function": FunctionGraph::constant(value.clone())}));
 
         let result = &session.cook().nodes[&owner];
+
         assert_eq!(result.error, None, "{parameter}");
+
         let expected = materialcraft_engine::nodes::find(definition).unwrap().param(parameter).unwrap().default.coerce_json(&json!(value)).unwrap();
+
         assert_eq!(result.parameters[parameter], expected);
     }
 
     let owner = node(&mut session, "uniform");
     command(&mut session, "graph.node.function", json!({"id": owner, "param": "color", "function": FunctionGraph::constant(Value::Float(0.5))}));
+
+    // A gray level fills the color channels, as the library's uniform colors rely on
+    let result = &session.cook().nodes[&owner];
+
+    assert_eq!(result.error, None);
+    assert_eq!(result.parameters["color"].as_vec4(), Some([0.5, 0.5, 0.5, 1.0]));
+
+    let owner = node(&mut session, "uniform");
+    command(&mut session, "graph.node.function", json!({"id": owner, "param": "color", "function": FunctionGraph::constant(Value::Int(1))}));
+
     assert!(session.cook().nodes[&owner].error.as_ref().unwrap().contains("Float4"));
+
     let bitmap = node(&mut session, "bitmap");
+
     assert!(execute(&mut session, "graph.node.function", &json!({"id": bitmap, "param": "resource"})).is_err());
+}
+
+#[test]
+fn native_channel_parameters_accept_scalar_functions_without_changing_their_bodies() {
+    let mut session = new_session();
+    session.preview_size = Some(16);
+    for (definition, parameters) in [("levels", &["in_low", "in_mid", "in_high", "out_low", "out_high"][..]), ("fx_map", &["background"][..])] {
+        for parameter in parameters {
+            let owner = node(&mut session, definition);
+            let function = FunctionGraph::constant(Value::Float(0.25));
+            command(&mut session, "graph.node.function", json!({"id": owner, "param": parameter, "function": function}));
+            let target = materialcraft_engine::FunctionGraphTarget::Dynamic { node: owner, parameter: (*parameter).into() };
+
+            assert!(materialcraft_engine::function_inspection::warnings_for(session.graph().unwrap(), &target, &function).is_empty());
+
+            let result = &session.cook().nodes[&owner];
+
+            assert_eq!(result.error, None, "{definition}.{parameter}");
+
+            let expected = if definition == "fx_map" { Value::Color([0.25, 0.25, 0.25, 1.0]) } else { Value::Float4([0.25; 4]) };
+
+            assert_eq!(result.parameters[*parameter], expected);
+
+            let bytes = formats::sbs::write_sbs(&session.pkg).unwrap();
+            let loaded = formats::sbs::read_sbs(&bytes, "scalar-channel.sbs", &|_| None).unwrap();
+
+            assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+
+            let reopened_node = loaded.pkg.graphs[0].nodes.last().unwrap();
+            let reopened_id = reopened_node.id;
+            let saved_function = &reopened_node.functions[*parameter];
+
+            assert_eq!(saved_function.nodes.len(), 1);
+            assert_eq!(saved_function.nodes[0].value, Some(Value::Float(0.25)));
+
+            let mut reopened = Session::new(loaded.pkg);
+            reopened.preview_size = Some(16);
+
+            assert_eq!(reopened.cook().nodes[&reopened_id].parameters[*parameter], expected);
+        }
+    }
 }
 
 #[test]
@@ -335,7 +399,8 @@ fn base_functions_inherit_from_the_primary_input_and_bypasses_keep_input_dimensi
 
     let cooked = session.cook();
     let image = cooked.image(blend, 0).unwrap();
-    assert_eq!((image.w, image.h), (16, 16));
+
+    assert_eq!((image.width(), image.height()), (16, 16));
     assert_eq!(cooked.nodes[&blend].base.size, [32, 32]);
     assert_eq!(cooked.nodes[&output].base.size, [32, 32]);
 }

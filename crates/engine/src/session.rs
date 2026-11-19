@@ -1,70 +1,15 @@
 //! The session: the open package, the graph being edited, selection, views, snapshot undo and
 //! the cook cache.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use craft_texture::Image;
 use materialcraft_core::{Graph, NodeId, Package, ResourceBytes};
 use materialcraft_eval::{Cache, Cooked, Options};
-use materialcraft_image::Image;
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::Snapshot;
-use crate::{AnnotationSelection, Clip, EngineError, Result};
-
-/// The 3D view's scene and look.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct View3d {
-    /// Built-in mesh: `rounded_cube`, `cube`, `sphere`, `cylinder`, `plane`, `torus`, `material_ball`.
-    pub scene: String,
-    /// UV repeats of the material on the mesh.
-    pub tiling: f32,
-    /// Camera yaw and pitch (degrees) and distance (mesh radii).
-    pub yaw: f32,
-    pub pitch: f32,
-    pub distance: f32,
-    /// Where the camera orbits: offset from the mesh center (mesh radii, world axes).
-    pub target: [f32; 3],
-    /// Environment: `studio`, `sunset`, `overcast`, `night`.
-    pub environment: String,
-    pub env_rotation: f32,
-    pub exposure: f32,
-    /// Height relief in mesh radii
-    pub height_scale: f32,
-    pub height_level: f32,
-    pub normal_y_flip: bool,
-    pub show_axis: bool,
-    pub show_grid: bool,
-    /// See through the mesh where the material's alpha (opacity output, else base color alpha)
-    /// is below one.
-    pub transparency: bool,
-    /// Show the material's alpha channel on the mesh instead of the lit material.
-    pub alpha_view: bool,
-}
-
-impl Default for View3d {
-    fn default() -> Self {
-        View3d {
-            scene: "rounded_cube".into(),
-            tiling: 1.0,
-            yaw: 35.0,
-            pitch: 25.0,
-            distance: 3.2,
-            target: [0.0; 3],
-            environment: "studio".into(),
-            env_rotation: 0.0,
-            exposure: 0.0,
-            height_scale: 0.04,
-            height_level: 0.0,
-            normal_y_flip: false,
-            show_axis: false,
-            show_grid: false,
-            transparency: true,
-            alpha_view: false,
-        }
-    }
-}
+use crate::{AnnotationSelection, Clip, DisplaySnapshot, EngineError, Result, View2d, View3d};
 
 /// The 3D view's camera preferences. The app keeps them in its preferences (Edit ▸ Preferences)
 /// and pushes them in with [`Session::set_camera_prefs`]; headless sessions use the defaults.
@@ -98,20 +43,6 @@ impl CameraPrefs {
     }
 }
 
-/// What the 2D view shows.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct View2d {
-    pub node: Option<NodeId>,
-    pub port: usize,
-    /// Repeat the image 3×3 to check tiling.
-    pub tiled: bool,
-    /// `rgba`, `r`, `g`, `b`, `a`.
-    pub channel: String,
-    /// Overlay the luminance/channel histogram.
-    pub histogram: bool,
-}
-
 /// The prefix of warning lines in [`Session::log`].
 pub const WARNING_PREFIX: &str = "Warning: ";
 
@@ -135,6 +66,10 @@ pub struct Session {
     pub annotation_target: crate::AnnotationTarget,
     pub view2d: View2d,
     pub view3d: View3d,
+    /// The 3D view a reset goes back to, when the user saved one as the default
+    pub default_view3d: Option<View3d>,
+    /// Opening a material graph shows its outputs in the 3D view (Preferences ▸ Graph)
+    pub view_outputs_on_open: bool,
     pub material_preview: crate::MaterialPreview,
     pub(crate) cooked_graph: Option<usize>,
     pub(crate) material_cooked: std::collections::BTreeMap<usize, Cooked>,
@@ -143,6 +78,9 @@ pub struct Session {
     /// 3D view camera preferences (set with [`Session::set_camera_prefs`]).
     pub camera: CameraPrefs,
     pub history_prefs: crate::HistoryPrefs,
+    pub library_cache_prefs: crate::LibraryCachePrefs,
+    /// Requests handled by the UI without editing packages or their undo histories.
+    pub library_cache_clear_epoch: u64,
     pub modified: bool,
     pub log: Vec<String>,
     /// What the last opened SBS package held that MaterialCraft couldn't read; empty after a clean open.
@@ -160,11 +98,15 @@ pub struct Session {
     pub cache: Arc<Mutex<Cache>>,
     /// A mesh loaded for the 3D view (`scene: "custom"`): its file name and geometry.
     pub custom_mesh: Option<(String, Arc<materialcraft_geom::Mesh>)>,
+    /// Changes on each successful mesh load, including loads under the same name
+    pub custom_mesh_generation: u64,
+    pub(crate) display_snapshot: Option<DisplaySnapshot>,
+    pub(crate) display_output: Option<DisplaySnapshot>,
     /// The node library loaded from the SBS library folder
     pub library: Arc<crate::node_library::NodeLibrary>,
     pub(crate) history: crate::document_history::DocumentHistory,
     group: Option<(Snapshot, bool)>,
-    decoded: Arc<Mutex<HashMap<(u64, bool), Image>>>,
+    decoded: Arc<Mutex<crate::decoded_images::DecodedImages>>,
 }
 
 impl Session {
@@ -182,6 +124,7 @@ impl Session {
                 library_sources.insert(path.clone(), package.clone());
             }
         }
+
         let mut session = Session {
             environment: Default::default(),
             document_id: 0,
@@ -199,11 +142,15 @@ impl Session {
             selection: Vec::new(),
             annotation_selection: None,
             annotation_target: Default::default(),
-            view2d: View2d { channel: "rgba".into(), ..View2d::default() },
+            view2d: View2d::default(),
             view3d: View3d::default(),
+            default_view3d: None,
+            view_outputs_on_open: true,
             preview_size: Some(512),
             camera: CameraPrefs::default(),
             history_prefs: crate::HistoryPrefs::default(),
+            library_cache_prefs: crate::LibraryCachePrefs::default(),
+            library_cache_clear_epoch: 0,
             modified: false,
             log: Vec::new(),
             load_warnings: Vec::new(),
@@ -215,20 +162,38 @@ impl Session {
             cook_epoch: 0,
             cache: Arc::new(Mutex::new(Cache::default())),
             custom_mesh: None,
+            custom_mesh_generation: 0,
+            display_snapshot: None,
+            display_output: None,
             library: Default::default(),
             history: Default::default(),
             group: None,
-            decoded: Arc::new(Mutex::new(HashMap::new())),
+            decoded: Arc::new(Mutex::new(crate::decoded_images::DecodedImages::default())),
         };
+
         session.refresh_links();
         for warning in &library.warnings {
             session.warn(warning.clone());
         }
+
         if !library.packages.contains_key(crate::function_library::STANDARD_PACKAGE) {
             session.warn(format!("Missing function library: {} did not load", crate::function_library::STANDARD_PACKAGE));
         }
+
         session.library = library;
         session
+    }
+
+    /// Hand one immutable displayed snapshot to the next command
+    pub fn begin_display_handoff(&mut self, snapshot: DisplaySnapshot) {
+        self.display_snapshot = Some(snapshot);
+        self.display_output = None;
+    }
+
+    /// Release an unused input and return a clipboard result after the command finishes
+    pub fn finish_display_handoff(&mut self) -> Option<DisplaySnapshot> {
+        self.display_snapshot = None;
+        self.display_output.take()
     }
 
     /// The graph being edited.
@@ -304,6 +269,7 @@ impl Session {
             }
             return result;
         }
+
         self.begin_group(label);
         let r = f(self);
         match r {
@@ -314,6 +280,7 @@ impl Session {
                 }
             }
         }
+
         r
     }
 
@@ -358,6 +325,7 @@ impl Session {
     pub fn changed(&mut self) {
         self.modified = true;
         self.dirty = true;
+
         // Publish a grouped edit only after it succeeds, so rollback cannot dirty other packages
         if self.group.is_none() {
             self.refresh_links();
@@ -415,32 +383,41 @@ impl Session {
 
     /// A decoder for the package's bitmap resources (memoized, shareable with worker threads).
     pub fn resource_decoder(&self) -> impl Fn(&str) -> Option<Image> + Sync + Send + 'static {
-        let mut res: Vec<(String, ResourceBytes)> = self.pkg.resources.iter().map(|r| (r.name.clone(), r.bytes.clone())).collect();
-        res.extend(
+        let mut resources: Vec<(String, ResourceBytes)> = self.pkg.resources.iter().map(|r| (r.name.clone(), r.bytes.clone())).collect();
+        resources.extend(
             self.pkg
                 .dependencies
                 .iter()
                 .flat_map(|(file, package)| package.resources.iter().map(move |resource| (format!("{file}\0{}", resource.name), resource.bytes.clone()))),
         );
-        let memo = self.decoded.clone();
+        let decoded = self.decoded.clone();
+
         // Release decoded images of deleted or replaced resources
-        memo.lock().unwrap_or_else(PoisonError::into_inner).retain(|(k, _), _| res.iter().any(|(_, b)| b.content_hash() == *k));
+        let hashes = resources.iter().map(|(_, bytes)| bytes.content_hash()).collect();
+        decoded.lock().unwrap_or_else(PoisonError::into_inner).retain_resources(&hashes);
         move |requested: &str| {
-            let (name, linear) = materialcraft_image::split_resource_key(requested);
-            let (_, bytes) = res.iter().find(|(n, _)| n == name)?;
+            let (name, linear) = craft_texture::split_resource_key(requested);
+            let (_, bytes) = resources.iter().find(|(name_candidate, _)| name_candidate == name)?;
             let key = (bytes.content_hash(), linear);
-            if let Some(i) = memo.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
-                return Some(i.clone());
+            if let Some(image) = decoded.lock().unwrap_or_else(PoisonError::into_inner).get(&key) {
+                return Some(image);
             }
-            let img = materialcraft_formats::decode(bytes.as_slice(), linear).ok()?;
-            memo.lock().unwrap_or_else(PoisonError::into_inner).insert(key, img.clone());
-            Some(img)
+
+            let image = materialcraft_formats::decode(bytes.as_slice(), linear).ok()?;
+            decoded.lock().unwrap_or_else(PoisonError::into_inner).insert(key, image.clone());
+            Some(image)
         }
     }
 
     /// Forget every decoded resource image (the package was replaced).
     pub(crate) fn clear_decoded(&self) {
         self.decoded.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
+
+    /// Background thumbnails need much less retention than the editable document.
+    pub(crate) fn limit_preview_caches(&mut self) {
+        self.cache = Arc::new(Mutex::new(Cache::new(32 << 20)));
+        self.decoded = Arc::new(Mutex::new(crate::decoded_images::DecodedImages::new(16 << 20)));
     }
 
     /// Cook the open graph now (at the preview size), on this thread.
@@ -461,6 +438,7 @@ impl Session {
         if result.graph != self.graph || result.cancelled() {
             return;
         }
+
         self.cooked_graph = Some(result.graph);
         self.cooked = result.cooked;
         self.material_cooked = result.materials;
@@ -499,12 +477,16 @@ impl Session {
     pub fn set_camera_prefs(&mut self, prefs: CameraPrefs) {
         self.camera = prefs.sanitized();
         self.view3d.target = self.camera.clamp_target(self.view3d.target);
+        if let Some(default_view) = &mut self.default_view3d {
+            default_view.target = self.camera.clamp_target(default_view.target);
+        }
     }
 
     /// Show a mesh file in the 3D view (OBJ, glTF, GLB).
     pub fn load_mesh_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         let mesh = materialcraft_formats::mesh::load_mesh(name, bytes)?;
         self.custom_mesh = Some((name.to_string(), Arc::new(mesh)));
+        self.custom_mesh_generation = self.custom_mesh_generation.wrapping_add(1);
         self.view3d.scene = "custom".into();
         Ok(())
     }

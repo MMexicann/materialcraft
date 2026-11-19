@@ -6,8 +6,8 @@ use crate::{
     prepared_graph::PreparedGraph,
     value_execution::evaluate_value,
 };
+use craft_texture::{Image, Kind};
 use materialcraft_core::{Node, Package, Value};
-use materialcraft_image::{Image, Kind};
 use materialcraft_nodes::{CookContext, find};
 use std::{
     collections::BTreeMap,
@@ -32,6 +32,7 @@ pub(crate) fn cook_node(
     cooked: &Cooked,
     graph_variables: &BTreeMap<String, Value>,
     options: &Options,
+    input_image: Option<&Image>,
     cache: &Mutex<Cache>,
 ) -> NodeResult {
     let (input_ports, output_ports) = prepared.ports(node.id);
@@ -75,6 +76,7 @@ pub(crate) fn cook_node(
             if output.as_ref().is_some_and(|output| output.as_value().is_some()) && !matches!(node.def.as_str(), "output" | "dot") {
                 input_error = Some(format!("input `{}` requires an image", port.id));
             }
+
             inputs.push(output.and_then(NodeOutput::as_image).cloned());
         }
 
@@ -82,10 +84,11 @@ pub(crate) fn cook_node(
     }
 
     let input_base = prepared.input_base(node.id, cooked);
-    let (mut base, base_values, base_error) = match crate::resolved_base_parameters::evaluate(&node.base, input_base, prepared.parent_base, &variables) {
+    let (mut base, base_values, base_error) = match crate::resolved_base_parameters::evaluate(&node.base, input_base, prepared.parent_base, &mut variables) {
         Ok((base, values)) => (base, values, None),
         Err(error) => (crate::ResolvedBaseParameters::resolve(&node.base, input_base, prepared.parent_base), BTreeMap::new(), Some(error)),
     };
+
     if node.disabled
         && let Some(input) = input_base
     {
@@ -103,6 +106,7 @@ pub(crate) fn cook_node(
         key,
         cached: false,
     };
+
     if let Some(error) = base_error {
         return fail(error, 0);
     }
@@ -111,21 +115,21 @@ pub(crate) fn cook_node(
         return fail(error, 0);
     }
 
-    if !node.functions.is_empty() || matches!(node.def.as_str(), "pixel_processor" | "value_processor" | "fx_map") {
+    if !node.functions.is_empty()
+        || matches!(node.def.as_str(), "pixel_processor" | "value_processor" | "fx_map" | "transformation" | "blur" | "directional_blur" | "sharpen")
+    {
         base.variables(variables.to_mut());
     }
 
-    let variables = &variables;
     let seed = base.seed;
-    let mut parameters = match resolve_parameters(package, node, definition, variables, seed, base.size) {
+    let mut parameters = match resolve_parameters(package, node, definition, &mut variables, seed, base.size) {
         Ok(parameters) => parameters,
         Err(error) => return fail(error, 0),
     };
+    let variables = &variables;
 
     let tile = base.tiling[0] && base.tiling[1];
 
-    // Input nodes read the caller's image for their identifier
-    let input_image = node.def.starts_with("input_").then(|| options.inputs.get(&identifier(node))).flatten();
     let resource_hash = match parameters.get("resource") {
         Some(Value::Text(name)) => package.resource(name).map_or(0, |r| r.bytes.content_hash()),
         _ => 0,
@@ -172,9 +176,28 @@ pub(crate) fn cook_node(
     } else if matches!(node.def.as_str(), "output" | "dot") && incoming.first().and_then(Option::as_ref).is_some_and(|output| output.as_value().is_some()) {
         incoming.first().copied().flatten().cloned().map(|output| vec![output]).ok_or("missing value input".into())
     } else if let Some(image) = input_image {
-        let image = image.resize(w, h, tile);
-        let image = if node.def == "input_grayscale" { image.to_gray() } else { image };
+        let mut image = if node.def == "input_grayscale" && image.kind() == Kind::Color {
+            // Grayscale bridges use equal RGB weights and preserve fused float order
+            let weight = 1.0 / 3.0;
+            image.map(Kind::Gray, |pixel| [pixel[2].mul_add(weight, pixel[1].mul_add(weight, pixel[0] * weight)), 0.0, 0.0, 0.0])
+        } else if node.def == "input_color" {
+            image.to_color()
+        } else {
+            image.clone()
+        };
 
+        // Bound resources clamp edges through stored factor-two levels
+        // Preserve resampling and storage conversion for HDR bridges
+        let resized = image.width() != w || image.height() != h;
+        while image.width() != w || image.height() != h {
+            let next = |current: u32, target: u32| {
+                if current < target { current.saturating_mul(2).min(target) } else { current.div_ceil(2).max(target) }
+            };
+            image = crate::output_precision::apply(image.resize(next(image.width(), w), next(image.height(), h), false), base.format);
+        }
+
+        // Resized inputs already store the final level at the declared precision
+        let image = if resized { image } else { crate::output_precision::apply(image, base.format) };
         Ok(vec![NodeOutput::Image(image)])
     } else if node.def == materialcraft_core::MISSING_NODE {
         let name = if node.label.is_empty() { "this node" } else { node.label.as_str() };
@@ -183,8 +206,17 @@ pub(crate) fn cook_node(
     } else if node.def == "graph_instance" {
         cook_instance(package, graph_index, node, input_ports, output_ports, &incoming, &parameters, (w, h), base, options, cache)
     } else if let Some(definition) = definition {
-        let context = CookContext { w, h, seed, tile, inputs: &inputs, params: &parameters, resource: options.resource, vars: variables };
-        (definition.cook)(&context).map(|images| images.into_iter().map(NodeOutput::Image).collect())
+        let context = CookContext { format: base.format, w, h, seed, tile, inputs: &inputs, params: &parameters, resource: options.resource, vars: variables };
+        (definition.cook)(&context).map(|images| {
+            images
+                .into_iter()
+                .map(|image| {
+                    // Bridges retain their source pixels; filters store their declared precision
+                    let image = if matches!(node.def.as_str(), "output" | "dot") { image } else { crate::output_precision::apply(image, base.format) };
+                    NodeOutput::Image(image)
+                })
+                .collect()
+        })
     } else {
         Err(format!("unknown node `{}`", node.def))
     };

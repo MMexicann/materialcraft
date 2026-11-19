@@ -64,8 +64,10 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::node_info_commands::specs());
         v.extend(crate::atomic_sample_commands::specs());
         v.extend(crate::material_cmds::specs());
+        v.extend(crate::material_bake::specs());
         v.extend(crate::edit_cmds::specs());
         v.extend(crate::document_history_commands::specs());
+        v.extend(crate::library_cache_commands::specs());
         v.extend(crate::embedded_edit_commands::specs());
         v.extend(crate::graph_cmds::specs());
         v.extend(crate::exposed_input_commands::specs());
@@ -86,6 +88,9 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(crate::connection_commands::specs());
         v.extend(crate::value_input_commands::specs());
         v.extend(crate::view_cmds::specs());
+        v.extend(crate::display_cmds::specs());
+        v.extend(crate::view3d_commands::specs());
+        v.extend(crate::save_all_commands::specs());
         v.extend(crate::material_preview_commands::specs());
         v.extend(crate::wire_cmds::specs());
         v
@@ -102,6 +107,7 @@ pub fn execute(s: &mut Session, id: &str, params: &J) -> Result<J> {
     if let Some(result) = crate::selection_commands::execute(s, id, params) {
         return result;
     }
+
     (spec.enabled)(s).map_err(|why| EngineError::Disabled { cmd: id.to_string(), why })?;
     let result = (spec.run)(s, params)?;
     if !s.selection.is_empty() || s.annotation_selection.is_some_and(|selection| !s.annotation_target.items(s).is_ok_and(|items| selection.exists(&items))) {
@@ -127,7 +133,7 @@ pub fn list(s: &Session, filter: Option<&str>) -> J {
     )
 }
 
-// ---------- param helpers ----------
+// Shared parameter parsing for commands
 
 pub(crate) fn bad(cmd: &str, msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: cmd.into(), msg: msg.into() }
@@ -178,6 +184,7 @@ pub(crate) fn ids_param(s: &Session, cmd: &str, p: &J) -> Result<Vec<NodeId>> {
     for id in &ids {
         g.node(*id).map_err(|_| bad(cmd, format!("no node {}", id.0)))?;
     }
+
     Ok(ids)
 }
 

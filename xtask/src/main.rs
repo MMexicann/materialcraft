@@ -73,6 +73,7 @@ fn metadata() -> Result<serde_json::Value, String> {
     if !out.status.success() {
         return Err(format!("cargo metadata failed:\n{}", String::from_utf8_lossy(&out.stderr)));
     }
+
     serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: bad JSON: {e}"))
 }
 
@@ -89,11 +90,13 @@ fn cmd_layers() -> Result<(), String> {
             }
         }
     }
+
     println!("\n{:<28} {:<8} workspace deps", "crate", "layer");
     for c in &crates {
         let ws: Vec<&str> = c.deps.iter().filter(|d| d.workspace).map(|d| d.name.as_str()).collect();
         println!("{:<28} {:<8} {}", c.name, layers::describe(&c.name), ws.join(", "));
     }
+
     let violations = layers::check(&crates);
     println!();
     if violations.is_empty() {
@@ -104,6 +107,7 @@ fn cmd_layers() -> Result<(), String> {
         for v in &violations {
             println!("  - {v}");
         }
+
         Err(format!("{} layering violation(s)", violations.len()))
     }
 }
@@ -111,7 +115,6 @@ fn cmd_layers() -> Result<(), String> {
 /// Packages that must build for wasm32-unknown-unknown, in dependency order.
 const WASM_PACKAGES: &[&str] = &[
     "materialcraft-core",
-    "materialcraft-image",
     "materialcraft-geom",
     "materialcraft-nodes",
     "materialcraft-eval",
@@ -130,12 +133,14 @@ fn cmd_wasm() -> Result<(), String> {
             println!("skip: {pkg} (not a workspace member yet)");
             continue;
         }
-        // One package per invocation, so no crate passes only thanks to features another enables.
+
+        // One package per invocation, so no crate passes only thanks to features another enables
         let mut c = cargo();
         c.args(["check", "--target", "wasm32-unknown-unknown", "-p", pkg]);
         let ok = run(c, &format!("cargo check --target wasm32-unknown-unknown -p {pkg}")).is_ok();
         results.push((*pkg, ok));
     }
+
     println!("\nwasm32-unknown-unknown check:");
     for (p, ok) in &results {
         println!("  {:<6} {p}", if *ok { "ok" } else { "FAIL" });
@@ -176,6 +181,7 @@ fn cmd_ci() -> Result<(), String> {
             return Err(format!("ci failed at `{name}`"));
         }
     }
+
     println!("\nCI summary: all {} steps passed", steps.len());
     Ok(())
 }

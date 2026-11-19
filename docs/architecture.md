@@ -9,10 +9,10 @@ them). Everything below the UI is plain Rust with no UI toolkit and builds for
 ```text
 L0  core      document model: Package → Graph → Node / Connection / Frame / Comment / Pin / ExposedParameter;
               Value (float, vectors, int, bool, color, enum, text, curve, gradient, function graph)
-L0  image     Image: grayscale or RGBA f32 planes behind an Arc (copy-on-write, free to share);
-              wrap/clamp sampling, bilinear, box/bilinear resampling, sRGB, 8-bit display
+L0  image     the craft-texture crate from storytold/craft-libs: grayscale or RGBA f32 planes behind an
+              Arc (free to share); repeat/clamp sampling, bilinear, box/bilinear resampling, sRGB, 8-bit display
 L0  geom      meshes, primitives (rounded cube, sphere, cylinder, plane, torus, material ball), BVH, camera
-L1  nodes     30 main-graph entries (NodeDefinition), 85 function operations, four pattern node kinds;
+L1  nodes     29 main-graph entries (NodeDefinition), 85 function operations, four pattern node kinds;
               shared image operations and iterative function/pattern execution
 L2  eval      cooking: topological order, output sizes (relative to input / parent, absolute, preview
               cap), parameter resolution (defaults, overrides, bindings to exposed inputs), the
@@ -21,9 +21,10 @@ L2  formats   native .sbs packages, .mcraft ZIP packages, .mcmat portable materi
               texture encode (PNG/JPEG/TGA/BMP/WEBP/EXR/HDR), atomic writes
 L3  engine    Session (open packages, active graph, selection, 2D/3D view state, snapshot undo, cache),
               the command registry, inspect, sample materials and graph templates
-L3  render    the 3D view: BVH ray casts, the height output displacing a subdivided mesh, GGX PBR with
-              prefiltered IBL + SH diffuse, alpha transparency (layered ray compositing) and an
-              alpha channel view, ACES tone mapping; procedural environments
+L3  render    the 3D view: BVH ray casts, the height output displacing a subdivided mesh, the
+              OpenPBR Surface model and simpler shaders with prefiltered IBL + SH diffuse, point
+              lights with shadows, alpha transparency (layered ray compositing) and an alpha
+              channel view, ACES or plain sRGB tone mapping; procedural environments
 L4  automation MCP server (rmcp), JSON-lines RPC (stdio/TCP with token), bridge client, workspace sandbox
 L5  ui-egui   the egui shell: docking (craft-ui), graph editor, library, properties, 2D/3D views,
               dialogs, menus, control channel with synthetic input
@@ -40,6 +41,12 @@ input images, resource bytes and (for instances) the sub-graph: equal keys hit t
 re-cooks only the nodes downstream of it, and undo finds earlier results again. A failing node shows
 a magenta image and its error; nodes after it still cook.
 
+The editor's output cache retains at most 256 MiB and 8192 entries; decoded resource images
+retain at most 128 MiB and 128 entries. Both evict least-recently-used data. An image larger than
+its cache budget serves the current cook without being retained in that cache. These are cache
+limits, not a limit on total process memory: open documents, undo, loaded library graphs, active
+cook results and GPU textures have their own lifetimes.
+
 Each cook builds a borrowed `core::GraphIndex` for node and connection lookups. `PreparedGraph`
 resolves the needed nodes' ports once; `graph_execution` schedules them and `node_execution` handles
 a single node. Parameter resolution, graph instances, value execution, output collection and cache
@@ -54,11 +61,12 @@ offset by powers of two or set absolutely. While editing, outputs are capped at 
 (512 px by default), with pixel-based parameters scaled by `w / 256` so previews and full-size
 exports look the same. Exports cook at full size through the same cache.
 
-The 2D toolbar and the 3D view's Display menu expose the shared preview limit (256, 512, 1024,
+The 2D toolbar and the 3D view's renderer settings expose the shared preview limit (256, 512, 1024,
 2048 or 4096 px, or Full size). This is a cap, so a 4K preview requires a graph/node configured
 for 4096 px or larger. Both controls run `view.previewSize` and persist the choice in preferences;
 control-channel calls to the same command also retain their size across UI frames. The 3D view
-uses those cooked maps, while its rendered frame follows the panel's physical pixel dimensions.
+uses those cooked maps, while its rendered frame follows the panel's physical pixel dimensions,
+or the render resolution its camera sets.
 If the device supports smaller textures than the cooked image, the 2D view reduces only the
 uploaded texture to that limit; source pixels, readout and screenshots retain the cooked size.
 
@@ -76,7 +84,8 @@ values whose own registries are empty, so cross-file references cannot create ow
 The registry is runtime state; SBS serializes the file references and connectors instead.
 Function instances resolve to bounded runtime call bodies before cooking. Each compiled call owns
 its program and reuses separate evaluation storage, so source lookup and compilation never happen
-per pixel. Calls share the execution-step budget and are capped at eight levels and 4096 nodes.
+per pixel. Calls share the execution-step budget and are capped at eight levels, 4096 nodes per
+graph and 8192 nodes across expanded calls.
 SBS Function nodes store the source URI in their instance data; a `materialcraftInterface` cache
 preserves unconnected input pins when a source file is unavailable.
 
@@ -96,22 +105,92 @@ name conflicts in the destination folder. Rename remains an explicit context-men
 
 `sbs://` resolves beneath `assets/sbs/`. Native installations can place that directory beside the
 executable or set `MATERIALCRAFT_SBS_DIR`; packaged and browser builds also embed the standard
-library. Alias paths cannot escape that root, and saved packages retain the alias. The Function
+library. Alias paths cannot escape that root; saves outside the library retain the alias. The Function
 Library lists these source graphs and inserts references into Function and processor canvases.
 Library aliases are read-only save destinations; an edited library can be saved to a local path.
 Resource paths resolve beside their owning package: `resources/tile.png` in
 `sbs://functions.sbs` reads `assets/sbs/resources/tile.png`, also addressable as
-`sbs://resources/tile.png`. Nested packages use their own adjacent `resources/` directory.
-Loaded resource bytes are embedded on save; unavailable files keep their reference and missing state.
+`sbs://resources/tile.png`. Nested library packages can use `../resources/` paths within
+the library root. Filesystem resolution checks the canonical target to prevent escaping that root.
+Native saves inside the library retain loaded resource links and write ordinary relative paths;
+ordinary project saves copy resource bytes alongside the package, and byte-only saves embed them.
+Unavailable resources retain their reference and missing state. Font resources first load their
+embedded data or their file relative to the SBS package, including user-supplied `cour.ttf`.
+Only a missing font uses `sbs://resources/LiberationMono-Regular.ttf`. The same precedence applies
+to direct Text font references and unresolved package font references; a blank reference keeps the
+built-in stroke font. Empty embedded data and empty files do not hide later font sources. If the
+fallback is also unavailable, the original SBS font name and reference remain available for repair.
+Resource loading and round trips preserve these fonts; the Text cook does not yet rasterize external fonts.
+
+The formats build reads Liberation Mono Regular and its OFL notice from the optional
+`CRAFT_FONTS_DIR/fonts/latin-manifest.txt` catalog, verifies its checksum, and embeds only that
+face for native and web builds. Font binaries stay in craft-fonts. Set `CRAFT_FONTS_REQUIRED=1`
+for releases to fail on an unavailable fallback. Without the optional input, builds still work;
+a missing font produces a repairable resource and a load warning. A checkout with the Latin
+catalog is required (for example craft-fonts revision `c1db6d1a8ed772191241c3d185e2104be84d8691`).
+All bundled `.sbs` packages, including nested materials, are original clean-room recreations
+covered together in [ATTRIBUTION.md](../ATTRIBUTION.md); their other resources retain separate credits.
+Bitmap/SVG references into another package import only the requested resource declarations,
+resolving asset paths beside that owner. These become local resource snapshots with distinct
+names on collisions; saving retains shared asset links inside the library or carries their bytes
+in portable saves. The owning package's graphs are not recursively imported for resource lookup.
 
 Every session loads the whole library folder once per process (`engine::node_library`, cached
 until `library.reload`). Each package joins every session's dependencies, so its graphs can be
 instanced, and the Library lists them: function graphs under Functions, sorted into its
-sub-categories by their folder (`Functions/Math/Pi` → Constant), other graphs under their attribute
-category. A package whose titled frames name Library categories ("Filters - Blurs") can also lay
+sub-categories by their folder (`Functions/Math/Pi` → Constant), other graphs under the category
+their attributes name: the category picks the top level (`Generator` → Texture generators, `Filter`
+→ Filters, `Mesh Adaptive` → Mesh-based generators…) and the first matching tag the sub-category
+(`Noise` → Noises, `Blur` → Blurs). Graphs marked `hideInLibrary`, and uncategorized functions
+beside material graphs, are helpers and stay out of the Library. A package whose titled frames name Library categories ("Filters - Blurs") can also lay
 the tree out (`formats::sbs::read_layout`): each node inside a frame becomes an entry there, listed
-as missing until a package in the folder provides it. Installed and browser builds embed
-`functions.sbs`.
+as missing until a package in the folder provides it. Installed and browser builds embed all SBS
+packages and shared resources, compressed at build time. Library packages share a flat dependency
+registry; only sources reachable from open packages refresh their instance interfaces on edits.
+
+Library thumbnails cook one visible native node or graph at a time, with 32 MiB of output caching and 16 MiB
+of decoded-image caching. Only output dependencies are evaluated. Editing takes priority, and
+leaving a tile or reloading the library cancels its cook between nodes. The next job waits for
+that worker to finish; hidden tiles cannot accumulate queued work or workers. At most 256
+finished previews retain GPU textures (about 5 MiB of pixels).
+
+Native Library previews also persist as PNGs in the platform cache folder selected by
+the existing `craft_update::Paths::per_user("materialcraft").cache`, under `previews/`: `%LOCALAPPDATA%` on
+Windows, `$XDG_CACHE_HOME` or `~/.cache` on Linux/BSD, and `~/Library/Caches` on macOS.
+This follows the [Craft storage policy](https://github.com/storytold/craft-libs/blob/main/docs/settings-storage.md).
+The cache covers native nodes and SBS graphs. Edit → Preferences → Library preview cache stores
+the disk limit (default 64 MiB, 0 disables persistence) and maximum stored previews (default 4096).
+The supported ranges are 0–65536 MiB and 1–65536 previews. Settings apply immediately to running
+workers, with background eviction when lowering either limit, including when all previews are warm.
+Older files are evicted first (access times refresh at most hourly). These disposable thumbnails are
+independent of projects, autosaves and temporary render storage.
+
+**Clear cache** removes stored previews and loaded library textures, cancels the active preview,
+and discards its result. Previews rebuild passively, one visible tile at a time; hidden native
+nodes and graphs do not cook. A job from before Clear cannot write its old result back. One
+maintenance worker handles trimming and clearing without blocking the UI. Cleanup failures
+report an error and bypass disk persistence for the session so stale previews cannot reappear.
+The same actions are available through `library.cache.configure` and `library.cache.clear`;
+`session.inspect` exposes `libraryCachePreferences`. These commands never edit package contents.
+
+Background workers do all reads, encoding, atomic writes (`craft-atomic`) and eviction; none run
+on the UI thread. Keys include the preview size, an executable content digest (including local
+rebuilds with an unchanged release version), and, for SBS graphs, the source packages and all
+resource bytes in their dependency closure. Changes become visible after `library.reload` or
+the next launch, just like the in-memory library. Corrupt, oversized or unavailable cache files
+are misses; failed or cancelled renders are never persisted. Concurrent writers use a
+nonblocking file lock to share the disk budget. The browser keeps previews in memory only.
+
+`MATERIALCRAFT_CACHE_DIR` overrides the app cache folder (`previews/` is appended); an empty
+value disables persistence. Scripted `MATERIALCRAFT_NO_PREFS` runs leave the user's cache
+untouched unless that explicit override is provided. Headless UI harnesses keep persistence off.
+
+The local `sbs_library_build` example converts native XML without a model round trip, checking that
+computational fields survive presentation edits and reference rewriting. It generates independent
+resource substitutes without reading source resource files. It retains supplied graph implementations;
+these edits do not establish redistribution rights. Native dependency closure and XML preservation do
+not establish runtime compatibility. The `sbs_library_audit` engine example separately reports import
+warnings and standalone function compilation failures; it does not validate every graph's output.
 
 Importing a user-supplied function package preserves its graph bodies, connections and positions;
 it does not replace them with the bundled library. Redundant legacy instance connectors are retained
@@ -150,8 +229,9 @@ cannot compile instead of substituting empty graphs. The source graph bodies are
 rewritten metadata does not establish redistribution rights.
 Local tests compare every converted body and evaluate all 171 functions against the supplied
 package with valid inputs and caller context. External runtime import and numerical compatibility
-still require validation. SBS's `updaterVersion` derives from the workspace's Cargo version;
-its format schema version is a separate constant.
+still require validation. The first SBS save writes the workspace's Cargo version to both
+`formatVersion` and `updaterVersion`. The package model retains the baseline `formatVersion`
+when reopening a document; later saves refresh only `updaterVersion`.
 
 Every user-visible action is a `CommandSpec` (`engine/src/*_cmds.rs`): id, label, menu, shortcut,
 params doc, `enabled`, `run`. The UI calls them through `MaterialCraftApp::run`; the CLI, the JSON
@@ -167,7 +247,11 @@ panel. The graph editor lays nodes out in graph space, draws cards with thumbnai
 results (uploaded once per cache key), wires as cubic beziers between typed ports (hit-tested
 against the curve, so wires can be selected, deleted, swapped or split with a reroute dot), and turns
 gestures into commands only when they complete. See [wires-and-alpha.md](wires-and-alpha.md). The 3D view renders with `materialcraft-render`
-on the CPU: half resolution while the camera moves, 2×2 supersampled when it rests.
+on the CPU: half resolution while the camera moves, 2×2 supersampled when it rests. Its state is
+`materialcraft_geom::view::View3d` (L0), so the engine edits it through `view.3d` and the renderer
+turns it into its settings (`Settings::for_view`) without either depending on the other. The
+grid, bounding box, light helpers and tangent space are lines the UI draws over the frame, cut
+where a ray from the camera meets the mesh first.
 
 The 3D material has its own `MaterialPreview` assignment state. Automatic graph output usages and
 explicit `MaterialSource` overrides resolve to channels from `core::MaterialChannel`, shared with the
@@ -252,6 +336,21 @@ save, reload and save copies independently. The same clean-room SBS codec writes
 ports, parameters, function graphs, pattern graphs and resources. Unsupported imports produce
 warnings; unknown nodes remain placeholders.
 
+Dynamic Gradient maps native `coordinate` and `uvselector` fields to position and orientation,
+including parameter functions. Earlier `position`/`orientation` spellings remain readable.
+
+FX-Map maps the native `hurst` parameter to Roughness, including parameter functions and SBS
+round trips. Rendering uses Hurst octave attenuation `2^(-roughness * quadrant_depth)` on each
+pattern's opacity, including alpha blending, while retaining the background. Switch, Iterate and
+Dot nodes do not increase that depth. Omitted roughness stays neutral for existing documents.
+This is an independent depth-weighting model; exact external-runtime pixel parity is unverified.
+The traversal budget permits full 512-by-512 quadtrees while retaining a 1,048,576-visit ceiling
+and the separate raster sample budget. Levels channel controls and FX-Map background functions
+can return either a scalar or Float4; scalar backgrounds keep opaque alpha. Other vector
+parameters retain exact output-type checks. Library conversion qualifies known bare standard
+function calls through an existing declared dependency, preserving local definitions and explicit
+references. It never chooses an unknown function target.
+
 `formats::project::ProjectFiles` builds either representation without changing the live package.
 Imports retain original bytes in snapshot history, including before the first save. Content-based
 asset filenames avoid overwriting resources shared by another SBS and allow the XML to be replaced
@@ -291,12 +390,7 @@ See [atomic-workflow.md](atomic-workflow.md) for the tested scope and remaining 
 
 ## Other apps
 
-A `.mcmat` portable material (`formats/src/material/`, `engine/src/material_cmds.rs`) holds a
-graph's cooked maps, its portable exposed inputs, presets and input nodes, and the source package.
-TextureCraft paints with it and re-cooks it by running `materialcraft-cli run <package>
-file.exportMaterial {path, size, values, inputs}`: the apps share the file format and the command
-line, never code. Graphs keep preview images for their input nodes (`Graph::input_images`, mesh
-maps from TextureCraft); `eval::cook` feeds them to the top-level graph, and a caller's images win.
+The MCMAT v3 publisher (`formats/src/material/`) copies a selected graph, its reachable graph and function definitions, and their resource bytes into a single SBS document with local references. The shared `craft-mcmat` crate writes the ZIP. The reader selects the sole root graph by its location. `engine/src/material_bake.rs` evaluates variations through the CPU cook engine. The CLI exposes the same entry for inspection, TextureCraft's labeled map export and the MaterialX OpenPBR export. Supplied images override the graph's saved input previews for that cook.
 
 Preview cooks publish the editor graph and assigned material graphs together. A synchronous cook
 invalidates older worker results. Displacement uses the assigned Height source even while another
