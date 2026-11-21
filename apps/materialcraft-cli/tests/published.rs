@@ -105,10 +105,9 @@ fn batch_rejects_invalid_script_shapes_before_saving() {
     let temp = tempfile::tempdir().unwrap();
     let dir = temp.path();
     let script_path = dir.join("batch.json");
-    for (script, expected) in [
-        (json!("not a batch"), "expected an array of steps or an object"),
-        (json!({"steps": {}, "save": "unexpected.mcraft"}), "steps must be an array"),
-    ] {
+    let invalid_root = (json!("not a batch"), "expected an array of steps or an object");
+    let invalid_steps = (json!({"steps": {}, "save": "unexpected.mcraft"}), "steps must be an array");
+    for (script, expected) in [invalid_root, invalid_steps] {
         std::fs::write(&script_path, script.to_string()).unwrap();
         let output = Command::new(env!("CARGO_BIN_EXE_materialcraft-cli")).current_dir(dir).args(["batch", "batch.json"]).output().unwrap();
         let error = String::from_utf8_lossy(&output.stderr);
