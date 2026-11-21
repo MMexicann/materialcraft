@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value as J, json};
 
-use materialcraft_core::{Connection, NodeId};
+use materialcraft_core::{Connection, Graph, NodeId};
 
 use crate::Clip;
 use crate::commands::{CommandSpec, always, bad, has_graph, has_selection, ids_param, point};
@@ -77,13 +77,18 @@ fn has_clip_or_param(s: &Session) -> std::result::Result<(), String> {
     has_graph(s)
 }
 
+/// Incoming links can be kept only in the same graph of the same open document.
+fn clipboard_origin(document: u64, graph: &Graph) -> String {
+    format!("{document}:{}", graph.sbs_path())
+}
+
 fn clip_of(s: &Session, ids: &[NodeId]) -> Result<Clip> {
     let g = s.graph()?;
     Ok(Clip {
         nodes: g.nodes.iter().filter(|n| ids.contains(&n.id)).cloned().collect(),
         connections: g.connections.iter().filter(|c| ids.contains(&c.from) && ids.contains(&c.to)).cloned().collect(),
         inputs: g.connections.iter().filter(|c| !ids.contains(&c.from) && ids.contains(&c.to)).cloned().collect(),
-        source_graph: Some(g.name.clone()),
+        source_graph: Some(clipboard_origin(s.document_id, g)),
     })
 }
 
@@ -144,7 +149,8 @@ fn paste(s: &mut Session, p: &J) -> Result<J> {
         return Err(bad("edit.paste", "too many nodes"));
     }
     let at = point(p, "at");
-    let keep_inputs = !crate::commands::boolp(p, "withoutLinks").unwrap_or(false) && clip.source_graph.as_deref() == Some(s.graph()?.name.as_str());
+    let keep_inputs =
+        !crate::commands::boolp(p, "withoutLinks").unwrap_or(false) && clip.source_graph.as_ref() == Some(&clipboard_origin(s.document_id, s.graph()?));
     let snap = crate::commands::boolp(p, "snapToGrid").unwrap_or(false);
 
     s.edit("Paste", |s| {
@@ -226,4 +232,44 @@ fn delete_relink(s: &mut Session, p: &J) -> Result<J> {
         s.selection.retain(|i| !ids.contains(i));
         Ok(json!({"deleted": ids.len()}))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Session, execute};
+    use materialcraft_core::{Graph, NodeId, Package};
+    use serde_json::json;
+
+    #[test]
+    fn paste_keeps_incoming_links_only_in_the_source_graph() {
+        let mut graph = Graph::new("Material");
+        graph.folder = "Source".into();
+        let source = graph.add_node("uniform", [0.0; 2]);
+        let first = graph.add_node("dot", [0.0; 2]);
+        let second = graph.add_node("dot", [0.0; 2]);
+        graph.connect(source, "output", first, "input").unwrap();
+        graph.connect(first, "output", second, "input").unwrap();
+        let mut other_folder = graph.clone();
+        other_folder.folder = "Other".into();
+        let mut package = Package::new("Original");
+        package.graphs = vec![graph.clone(), other_folder];
+        let mut session = Session::new(package);
+        execute(&mut session, "edit.copy", &json!({"ids": [first.0, second.0]})).unwrap();
+
+        let paste = |session: &mut Session| {
+            let result = execute(session, "edit.paste", &json!({})).unwrap();
+            let pasted = |i: usize| NodeId(result["ids"][i].as_u64().unwrap());
+            let graph = session.graph().unwrap();
+            assert_eq!(graph.input_of(pasted(1), "input").map(|c| c.from), Some(pasted(0)), "internal link is retained");
+            graph.input_of(pasted(0), "input").map(|c| c.from)
+        };
+        assert_eq!(paste(&mut session), Some(source), "same graph keeps the incoming wire");
+        execute(&mut session, "graph.open", &json!({"graph": 1})).unwrap();
+        assert_eq!(paste(&mut session), None, "same graph name in a different folder");
+
+        let mut other_package = Package::new("Destination");
+        other_package.graphs.push(graph);
+        session.open_package(other_package, None).unwrap();
+        assert_eq!(paste(&mut session), None, "same graph path in a different document");
+    }
 }
